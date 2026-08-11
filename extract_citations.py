@@ -14,7 +14,7 @@ from pathlib import Path
 import pdfplumber
 
 # Folder to read PDFs from
-FOLDER = "/Users/ep9k/Desktop/2026_files"
+FOLDER = "/Users/ep9k/Desktop/AI_Citation_Hallucinations/2026_files"
 
 # Section headings we're looking for, as regex patterns. Matched against a
 # single line after stripping numbering (e.g. "8.", "III.", "[3]") and
@@ -48,7 +48,7 @@ _NUMBERING_PREFIX = re.compile(
 # Headings that mark where the reference list ENDS (start of the next
 # section), so trailing appendices/supplements aren't counted as citations.
 SECTION_END_PATTERNS = [
-    r"appendix\w*",
+    r"appendi(x|ces)",
     r"acknowledg(e)?ments?",
     r"supplement(al|ary)?\s*(material)?",
     r"author\s+biograph\w*",
@@ -96,6 +96,17 @@ def _matches_heading_patterns(text, patterns):
         if re.fullmatch(pattern, candidate, flags=re.IGNORECASE):
             return True
 
+    # The squeezed fallback strips ALL non-letter characters (to catch
+    # letter-spaced headings like "R E F E R E N C E S"), but that also
+    # erases digits -- which means a Table-of-Contents line like
+    # "9. References........................90" reduces to exactly
+    # "references" and would otherwise be mistaken for the real heading,
+    # causing collection to start from the ToC and never find a valid end
+    # point. A genuine heading line never has digits glued onto it, so if
+    # the raw text contains any digit, skip this fallback entirely.
+    if any(ch.isdigit() for ch in text):
+        return False
+
     squeezed = re.sub(r"[^a-z]", "", text.lower())
     squeezed_targets = {
         re.sub(r"[^a-z]", "", re.sub(r"\\s\+", "", p.lower())) for p in patterns
@@ -112,8 +123,33 @@ def _is_heading_line(raw_text):
 
 
 def _is_section_end_line(raw_text):
-    """True if raw_text reads as a heading that marks the end of the reference list."""
-    return _matches_heading_patterns(_normalize(raw_text), SECTION_END_PATTERNS)
+    """True if raw_text reads as a heading that marks the end of the reference list.
+
+    Also catches a stop-heading that got merged onto the same extracted
+    line as the START of the next subsection (e.g. "10. Appendices 10.1
+    Kinetic Parameters used for Reactor Design..."), which happens when a
+    PDF doesn't leave enough vertical gap between a heading and the body
+    text right after it for pdfplumber to treat them as separate lines.
+    In that case the exact-match check below never fires because there's
+    extra text after the heading word, so we additionally check whether
+    the line at least STARTS with a stop-heading word immediately
+    followed by what looks like the next subsection's own numbering
+    (e.g. "10.1 ..."), which is a much safer signal than a bare substring
+    match (it wouldn't fire on a citation that merely mentions "Appendix"
+    in its title).
+    """
+    text = _normalize(raw_text)
+    if _matches_heading_patterns(text, SECTION_END_PATTERNS):
+        return True
+
+    candidate = _NUMBERING_PREFIX.sub("", text).strip()
+    for pattern in SECTION_END_PATTERNS:
+        m = re.match(pattern + r"\b", candidate, flags=re.IGNORECASE)
+        if m:
+            rest = candidate[m.end():].lstrip()
+            if not rest or re.match(r"\d+(\.\d+)*\b", rest):
+                return True
+    return False
 
 
 def has_references_section(pdf_path):
@@ -303,12 +339,9 @@ def count_references(pdf_path):
     Return the number of individual references/citations found in the
     PDF's reference section (0 if no such section is found).
 
-    Uses a hanging-indent left-margin heuristic: a line at (or very near)
-    the section's left margin starts a new reference; anything indented
-    further is a continuation of the previous one. Two-column layouts have
-    a left-column margin and a right-column margin that can differ by
-    hundreds of points, so each line is compared against the margin of
-    *its own* column, not a single margin for the whole page.
+    Delegates to _group_into_entries so the printed count always matches
+    what extract_references_from_pdf actually produces -- see that
+    function's docstring for the three grouping strategies used.
     """
     with pdfplumber.open(pdf_path) as pdf:
         lines = _collect_reference_lines(pdf)
@@ -316,12 +349,7 @@ def count_references(pdf_path):
     if not lines:
         return 0
 
-    margins = {}
-    for ln in lines:
-        col = ln["col"]
-        margins[col] = min(margins.get(col, ln["x0"]), ln["x0"])
-
-    count = sum(1 for ln in lines if ln["x0"] <= margins[ln["col"]] + MARGIN_TOLERANCE)
+    count = len(_group_into_entries(lines))
 
     # Degenerate fallback: if literally nothing landed at the margin
     # (extremely unlikely), treat the block as one reference rather than zero.
@@ -332,56 +360,242 @@ def count_references(pdf_path):
 # Building full reference text + extracting DOIs
 # ----------------------------------------------------------------------------
 
-DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>)\]]+", re.IGNORECASE)
-URL_RE = re.compile(r"(https?://[^\s\"'<>)\]]+|www\.[^\s\"'<>)\]]+)", re.IGNORECASE)
+DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>\]]+", re.IGNORECASE)
+URL_RE = re.compile(r"(https?://[^\s\"'<>\]]+|www\.[^\s\"'<>\]]+)", re.IGNORECASE)
 
 # After finding a DOI/URL match, look for a short lowercase/digit token
 # immediately following it (separated by the single space our line-joining
 # inserts). This reattaches fragments that wrapped onto their own line in
 # the original PDF -- e.g. a DOI ending "...2012.66679" continuing as "5"
 # on the next line ("...2012.666795"), or "...CD006801." continuing as
-# "pub2". Capped at a few iterations so it can't run away into real prose.
-_WRAP_CONTINUATION_RE = re.compile(r"^ ([a-z0-9][a-z0-9._\-]{0,30})(?=[\s).,;\]]|$)")
+# "pub2". URLs can wrap across several short hyphenated lines
+# (e.g. "fightcancer.org/policy-" / "resources/costs-cancer-rural-" /
+# "communities-" / "0"), so this allows more hops than a DOI would ever
+# need, while still stopping once real prose (a capitalized word, a new
+# sentence) resumes.
+_WRAP_CONTINUATION_RE = re.compile(r"^ ([a-z0-9][a-z0-9._/\-]{0,60})(?=[\s).,;\]]|$)")
+_MAX_WRAP_HOPS = 12
+
+
+def _trim_unbalanced_parens(s):
+    """Drop a trailing ')' that has no matching '(' within the match.
+
+    DOIs/URLs often legitimately contain a balanced "(24)"-style segment
+    (e.g. an issue number), but a trailing ')' that closes a *sentence*
+    around the citation -- not part of the link itself -- should still be
+    stripped.
+    """
+    while s.endswith(")") and s.count("(") < s.count(")"):
+        s = s[:-1]
+    return s
 
 
 def _reattach_wrapped_suffix(entry_text, match):
     """Extend a DOI/URL regex match to absorb any wrapped continuation tokens."""
     result = match.group(0)
     idx = match.end()
-    for _ in range(3):
+    for _ in range(_MAX_WRAP_HOPS):
         m = _WRAP_CONTINUATION_RE.match(entry_text[idx:])
         if not m:
             break
         result += m.group(1)
         idx += m.end()
-    return result.rstrip(".,;")
+    result = result.rstrip(".,;")
+    result = _trim_unbalanced_parens(result)
+    return result
+
+
+def _best_url_match(entry):
+    """
+    Return the URL regex Match most likely to be the actual citation link,
+    not an incidental mention of a site name earlier in the reference
+    (e.g. "...Www.bbc.com, 24 May 2024, www.bbc.com/news/articles/..."
+    should pick the second one, which has a real path).
+
+    Preference order: matches containing a "/" (i.e. an actual path, not
+    just a bare domain) over ones without; among ties, the longest match;
+    among further ties, the last one in the text (citations conventionally
+    put the actual link at the end).
+    """
+    matches = list(URL_RE.finditer(entry))
+    if not matches:
+        return None
+
+    def score(m):
+        text = m.group(0)
+        has_path = 1 if "/" in text else 0
+        return (has_path, len(text))
+
+    best_score = max(score(m) for m in matches)
+    candidates = [m for m in matches if score(m) == best_score]
+    return candidates[-1]
+
+
+# Some reference lists (common in IEEE-style technical reports) use
+# "[1]", "[2]", ... numbering with NO hanging indent -- every line,
+# including wrapped continuation lines, starts at the same left margin.
+# For those lists, the margin-based heuristic can't tell a new reference
+# from a continuation (everything looks like "new"), so we detect this
+# format and switch to using the bracket number itself as the boundary.
+_NUMBERED_ENTRY_RE = re.compile(r"^\[\d+\]\s*")
+
+
+# Some reference lists have NEITHER a hanging indent NOR bracket
+# numbering -- every line, including wrapped continuations, sits at the
+# same left margin, and there's no "[n]" marker to lean on either.
+# Almost every citation style (APA in particular, but this covers MLA's
+# date-in-parens variants too) places a parenthetical year -- or "(n.d.)"
+# for undated sources -- shortly after the reference starts, regardless
+# of whether it's led by a person's name ("Smith, J. (2020)...") or an
+# organization/title ("World Health Organization. (2014)...",
+# "ClearTax Accountants. (2025, November 14)..."). That makes it a far
+# more general boundary signal than matching person-author name patterns
+# alone, which misses every org- or title-led reference in a mixed list.
+#
+# A new entry is only recognized where BOTH of these hold:
+#   1. The line starts with a capital letter (title-case start).
+#   2. Everything accumulated so far for the CURRENT entry already
+#      contains a year/n.d. marker, AND the last line added ended with
+#      what looks like the end of a citation (a period, or a bare
+#      URL/DOI with no trailing period, which is common).
+# Requiring both avoids two failure modes: without (1), any mid-sentence
+# "(YYYY)"-shaped text (e.g. a subtitle like "(2025 update)") could be
+# mistaken for a new entry; without (2), an entry that ends in a bare URL
+# (no period) would never be recognized as "done", merging it with the
+# next one.
+_YEAR_OR_ND_PAREN = r"\((?:1[89]|20)\d{2}[^)]*\)|\(n\.d\.\)"
+_YEAR_OR_ND_PAREN_RE = re.compile(_YEAR_OR_ND_PAREN)
+_TITLE_CASE_START_RE = re.compile(r"^[A-Z]")
+_ENTRY_END_RE = re.compile(r"(https?://\S+|www\.\S+|10\.\d{4,9}/\S+)$", re.IGNORECASE)
+
+
+def _ends_with_url_or_doi(text):
+    """True if text ends with a bare URL/DOI -- the strongest signal that
+    a citation has actually finished, since a plain mid-entry period
+    (e.g. the break between a title and its journal name) can look
+    superficially "complete" too, but never coincides with a URL."""
+    return bool(_ENTRY_END_RE.search(text.rstrip()))
+
+
+_MIN_ENTRY_LENGTH_FOR_SPLIT = 60
+# A citation lacking any URL/DOI can still end in a plain period, but a
+# plain period alone is a much weaker signal (it can also just be the
+# break between a title and its journal name mid-citation) -- so it only
+# counts once the accumulated entry is unambiguously long.
+_MIN_ENTRY_LENGTH_FOR_PERIOD_ONLY_SPLIT = 150
+
+
+def _split_flush_left_by_year_marker(lines):
+    """Group flush-left lines into entries using the year/n.d.-marker
+    + entry-end combined signal described above.
+
+    A short "Author, I. (Year)." fragment already satisfies "has a year
+    marker" and "ends with a period" after just one line -- but that's
+    only the opening clause of the citation, not the whole thing. Real
+    references are almost always much longer than that (they still need
+    a title, journal, and often a URL/DOI), so a split is only allowed
+    once the accumulated entry has passed a minimum length -- otherwise
+    every reference gets chopped in half right after its author/date.
+
+    Ending in a URL/DOI is trusted at a lower length threshold, since
+    it's a much stronger "this citation is actually done" signal than a
+    plain period, which can also just be a title/journal sentence break
+    partway through a longer citation.
+    """
+    entries = []
+    current = []
+    seen_year_marker = False
+
+    for ln in lines:
+        text = ln["text"]
+        starts_title_case = bool(_TITLE_CASE_START_RE.match(text))
+
+        prev_entry_complete = False
+        if current and seen_year_marker:
+            joined_len = len(" ".join(current))
+            last = current[-1]
+            if _ends_with_url_or_doi(last) and joined_len >= _MIN_ENTRY_LENGTH_FOR_SPLIT:
+                prev_entry_complete = True
+            elif last.rstrip().endswith(".") and joined_len >= _MIN_ENTRY_LENGTH_FOR_PERIOD_ONLY_SPLIT:
+                prev_entry_complete = True
+
+        is_new_entry = starts_title_case and (not current or prev_entry_complete)
+
+        if is_new_entry and current:
+            entries.append(" ".join(current))
+            current = [text]
+            seen_year_marker = bool(_YEAR_OR_ND_PAREN_RE.search(text))
+        else:
+            current.append(text)
+            if _YEAR_OR_ND_PAREN_RE.search(text):
+                seen_year_marker = True
+
+    if current:
+        entries.append(" ".join(current))
+    return entries
+
+
+# If more than this fraction of lines sit at the column margin, there's
+# no meaningful hanging indent to distinguish continuations from new
+# entries -- everything is flush left -- so we fall back to the
+# year-marker heuristic instead of trusting the margin.
+_FLUSH_LEFT_MARGIN_FRACTION = 0.85
 
 
 def _group_into_entries(lines):
     """
     Group already-collected reference-section lines into full citation
-    strings, using each line's own column margin to decide where a new
-    reference starts (see count_references for why margins are per-column).
+    strings.
+
+    Three strategies, chosen per document:
+      1. Bracket-numbered lists ("[1] Author...", "[2] Author..."): a new
+         reference starts exactly where a line begins with "[n]".
+      2. Hanging-indent lists (the common academic style): a line at (or
+         very near) its column's left margin starts a new reference;
+         anything indented further is a continuation of the previous one.
+      3. Flush-left lists with no numbering at all (no hanging indent to
+         lean on, detected when nearly every line sits at the margin):
+         see _split_flush_left_by_year_marker.
     """
     if not lines:
         return []
 
-    margins = {}
-    for ln in lines:
-        col = ln["col"]
-        margins[col] = min(margins.get(col, ln["x0"]), ln["x0"])
+    uses_bracket_numbering = any(_NUMBERED_ENTRY_RE.match(ln["text"]) for ln in lines)
 
     entries = []
     current = []
-    for ln in lines:
-        is_new_entry = ln["x0"] <= margins[ln["col"]] + MARGIN_TOLERANCE
-        if is_new_entry and current:
+
+    if uses_bracket_numbering:
+        for ln in lines:
+            is_new_entry = bool(_NUMBERED_ENTRY_RE.match(ln["text"]))
+            if is_new_entry and current:
+                entries.append(" ".join(current))
+                current = [ln["text"]]
+            else:
+                current.append(ln["text"])
+        if current:
             entries.append(" ".join(current))
-            current = [ln["text"]]
+    else:
+        margins = {}
+        for ln in lines:
+            col = ln["col"]
+            margins[col] = min(margins.get(col, ln["x0"]), ln["x0"])
+
+        at_margin = [ln["x0"] <= margins[ln["col"]] + MARGIN_TOLERANCE for ln in lines]
+        margin_fraction = sum(at_margin) / len(lines)
+
+        if margin_fraction > _FLUSH_LEFT_MARGIN_FRACTION:
+            entries = _split_flush_left_by_year_marker(lines)
         else:
-            current.append(ln["text"])
-    if current:
-        entries.append(" ".join(current))
+            for ln in lines:
+                is_new_entry = ln["x0"] <= margins[ln["col"]] + MARGIN_TOLERANCE
+                if is_new_entry and current:
+                    entries.append(" ".join(current))
+                    current = [ln["text"]]
+                else:
+                    current.append(ln["text"])
+            if current:
+                entries.append(" ".join(current))
 
     entries = [re.sub(r"\s{2,}", " ", e).strip() for e in entries]
     return entries
@@ -404,10 +618,15 @@ def extract_references_from_pdf(pdf_path):
     for entry in entries:
         doi_match = DOI_RE.search(entry)
         doi = _reattach_wrapped_suffix(entry, doi_match) if doi_match else None
+
+        url_match = _best_url_match(entry)
+        url = _reattach_wrapped_suffix(entry, url_match) if url_match else None
+
         records.append(
             {
                 "filename": pdf_path.name,
                 "reference": entry,
+                "url": url,
                 "doi": doi,
             }
         )
@@ -428,7 +647,7 @@ def build_references_dataframe(pdf_paths):
             continue
         all_records.extend(extract_references_from_pdf(path))
 
-    return pd.DataFrame(all_records, columns=["filename", "reference", "doi"])
+    return pd.DataFrame(all_records, columns=["filename", "reference", "url", "doi"])
 
 
 
@@ -454,4 +673,3 @@ if __name__ == "__main__":
     output_path = folder / "references.csv"
     df.to_csv(output_path, index=False)
     print(f"\nSaved to {output_path}")
-
