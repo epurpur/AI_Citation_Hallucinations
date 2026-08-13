@@ -21,7 +21,7 @@ FOLDER = "/Users/ep9k/Desktop/AI_Citation_Hallucinations/2026_files"
 # punctuation, so "References", "8. References", "REFERENCES:", and
 # "III. Bibliography" all count.
 SECTION_HEADING_PATTERNS = [
-    r"references?",
+    r"references?",=
     r"citations?",
     r"bibliography",
     r"works\s+cited",
